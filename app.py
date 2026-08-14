@@ -1119,6 +1119,26 @@ border-radius:var(--radius);padding:8px;cursor:pointer;font-size:.75rem;width:10
             </div>
           </div>
         </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+          <div>
+            <label style="font-size:.8rem;color:var(--dim)">📊 出力サンプルレート</label>
+            <select id="aiSampleRate" style="width:100%;margin-top:4px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text)">
+              <option value="44100">44,100 Hz (CD)</option>
+              <option value="48000" selected>48,000 Hz</option>
+              <option value="96000">96,000 Hz (Hi-Res)</option>
+              <option value="192000">192,000 Hz (Ultra Hi-Res)</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--dim)">💾 出力形式</label>
+            <select id="aiOutFormat" style="width:100%;margin-top:4px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text)">
+              <option value="wav">WAV (無圧縮)</option>
+              <option value="flac">FLAC (可逆)</option>
+              <option value="mp3">MP3 (320kbps)</option>
+              <option value="ogg">OGG Vorbis</option>
+            </select>
+          </div>
+        </div>
       </div>
 
       <div id="aiFileList"></div>
@@ -1360,6 +1380,8 @@ aiFileInput.addEventListener('change', ()=>{if(aiFileInput.files.length) aiUploa
 async function aiUploadFiles(fileList) {
   const fd = new FormData();
   for (const f of fileList) fd.append('files', f);
+  const sr = document.getElementById('aiSampleRate')?.value || '48000';
+  fd.append('sample_rate', sr);
   setStatus('アップロード + AI分析中...');
   try {
     // Upload
@@ -1441,11 +1463,12 @@ async function aiApplyAndDownload(fileId, btn) {
   btn.disabled = true; btn.textContent = '⏳ 処理中...';
   const aiResult = aiFiles.find(f=>f.file_id===fileId);
   if (!aiResult) return;
-  const fmt = document.getElementById('outFormat')?.value || 'wav';
+  const fmt = document.getElementById('aiOutFormat')?.value || 'wav';
+  const sr = parseInt(document.getElementById('aiSampleRate')?.value || '48000');
   try {
     const r = await fetch('/remaster', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({file_id:fileId, params:aiResult.settings, format:fmt})
+      body:JSON.stringify({file_id:fileId, params:{...aiResult.settings, sample_rate:sr}, format:fmt})
     });
     if (!r.ok) throw new Error('remaster failed');
     const blob = await r.blob();
