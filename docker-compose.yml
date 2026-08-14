@@ -1,0 +1,18 @@
+services:
+  remaster:
+    build: .
+    container_name: remaster-studio
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REMASTER_DATA_DIR=/app/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
