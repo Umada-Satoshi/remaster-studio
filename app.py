@@ -23,7 +23,7 @@ import wave
 from pathlib import Path
 
 import numpy as np
-from flask import Flask, jsonify, request, send_file, render_template_string
+from flask import Flask, jsonify, request, send_file, render_template_string, make_response
 from scipy import signal
 from dsp_optimized import (
     limiter_fast, phase_limit_fast, multiband_compress_fast,
@@ -1949,7 +1949,12 @@ function toast(msg) {
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    resp = make_response(render_template_string(HTML))
+    # キャッシュ無効化 — 最新HTMLを確実に配信
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/upload", methods=["POST"])
