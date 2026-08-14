@@ -110,8 +110,9 @@ def classify_genre(audio, sr, analysis):
     return best, round(confidence, 2)
 
 
-def recommend_settings(analysis, genre, confidence):
-    """Recommend optimal mastering parameters based on analysis + genre."""
+def recommend_settings(analysis, genre, confidence, bias=None):
+    """Recommend optimal mastering parameters based on analysis + genre.
+    bias: {bass_bias, high_bias, comp_bias, strength} — user taste offset."""
     bands = analysis["bands"]
     crest = analysis["crest_db"]
     rms = analysis["rms_db"]
@@ -199,6 +200,25 @@ def recommend_settings(analysis, genre, confidence):
     p["_reasoning"] = reasoning
     p["_genre"] = genre
     p["_confidence"] = confidence
+
+    # ── ユーザー味付け bias 適用 ──────────────────────────────────
+    if bias:
+        strength = bias.get("strength", 0.5)
+        bass_bias = bias.get("bass_bias", 0) * strength
+        high_bias = bias.get("high_bias", 0) * strength
+        comp_bias = bias.get("comp_bias", 0) * strength
+
+        if bass_bias != 0:
+            p["subBass"] = round(p["subBass"] + bass_bias, 1)
+            p["bass"] = round(p["bass"] + bass_bias * 0.7, 1)
+            reasoning.append(f"味付け: 重低音 {bass_bias:+.1f}dB")
+        if high_bias != 0:
+            p["high"] = round(p["high"] + high_bias, 1)
+            reasoning.append(f"味付け: 高域 {high_bias:+.1f}dB")
+        if comp_bias != 0:
+            p["compTh"] = round(p["compTh"] + comp_bias, 1)
+            reasoning.append(f"味付け: コンプ {comp_bias:+.1f}dB")
+
     return p
 
 
@@ -1051,6 +1071,56 @@ border-radius:var(--radius);padding:8px;cursor:pointer;font-size:.75rem;width:10
         <div class="hint">AIがジャンルを判定し、最適なマスタリング設定を自動提案します</div>
         <input type="file" id="aiFileInput" accept="audio/*" multiple style="display:none">
       </div>
+
+      <!-- 味付けコントロール -->
+      <div id="aiTasteControls" style="background:var(--card);border-radius:var(--radius);padding:16px;margin-bottom:16px">
+        <div class="section-title" style="margin-bottom:12px">🎨 AI味付け</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div>
+            <label style="font-size:.8rem;color:var(--dim)">味付けプロフィール</label>
+            <select id="aiTasteProfile" style="width:100%;margin-top:4px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text)">
+              <option value="balanced">⚖️ バランス（デフォルト）</option>
+              <option value="bass_heavy">🔊 重低音派</option>
+              <option value="bright">✨ クリア・明るめ</option>
+              <option value="warm">🌤️ ウォーム</option>
+              <option value="punchy">💪 パンチー</option>
+              <option value="reference">🎧 レファレンス</option>
+              <option value="custom">🎛️ カスタム（スライダー下で調整）</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--dim)">味付けの強さ</label>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+              <input type="range" id="aiTasteStrength" min="0" max="100" value="50" style="flex:1">
+              <span id="aiTasteStrengthVal" style="font-size:.8rem;min-width:35px">50%</span>
+            </div>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:12px">
+          <div>
+            <label style="font-size:.8rem;color:var(--dim)">🔊 重低音 bias</label>
+            <div style="display:flex;align-items:center;gap:6px">
+              <input type="range" id="aiBiasBass" min="-5" max="5" step="0.5" value="0" style="flex:1">
+              <span id="aiBiasBassVal" style="font-size:.8rem;min-width:35px">0dB</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--dim)">✨ 高域 bias</label>
+            <div style="display:flex;align-items:center;gap:6px">
+              <input type="range" id="aiBiasHigh" min="-5" max="5" step="0.5" value="0" style="flex:1">
+              <span id="aiBiasHighVal" style="font-size:.8rem;min-width:35px">0dB</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--dim)">💪 コンプ bias</label>
+            <div style="display:flex;align-items:center;gap:6px">
+              <input type="range" id="aiBiasComp" min="-5" max="5" step="0.5" value="0" style="flex:1">
+              <span id="aiBiasCompVal" style="font-size:.8rem;min-width:35px">0dB</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div id="aiFileList"></div>
       <div id="aiResults" class="hidden" style="margin-top:16px"></div>
     </div>
@@ -1233,6 +1303,52 @@ function resetBatch() {
 }
 
 // ── AI Auto-Optimize ────────────────────────────────────────────────
+// 味付けプロフィール定義
+const TASTE_PROFILES = {
+  balanced:  {bassBias: 0, highBias: 0, compBias: 0},
+  bass_heavy:{bassBias: 3, highBias: -1, compBias: 1},
+  bright:    {bassBias: -1, highBias: 3, compBias: 0},
+  warm:      {bassBias: 2, highBias: -2, compBias: -1},
+  punchy:    {bassBias: 1, highBias: 1, compBias: 2},
+  reference: {bassBias: 0, highBias: 0, compBias: 0},
+  custom:    {bassBias: 0, highBias: 0, compBias: 0},
+};
+
+// スライダー値表示の更新
+document.getElementById('aiTasteStrength').addEventListener('input', e => {
+  document.getElementById('aiTasteStrengthVal').textContent = e.target.value + '%';
+});
+document.getElementById('aiBiasBass').addEventListener('input', e => {
+  document.getElementById('aiBiasBassVal').textContent = (e.target.value>0?'+':'')+e.target.value+'dB';
+});
+document.getElementById('aiBiasHigh').addEventListener('input', e => {
+  document.getElementById('aiBiasHighVal').textContent = (e.target.value>0?'+':'')+e.target.value+'dB';
+});
+document.getElementById('aiBiasComp').addEventListener('input', e => {
+  document.getElementById('aiBiasCompVal').textContent = (e.target.value>0?'+':'')+e.target.value+'dB';
+});
+
+// プロフィール選択時にスライダーを自動設定
+document.getElementById('aiTasteProfile').addEventListener('change', e => {
+  const p = TASTE_PROFILES[e.target.value] || TASTE_PROFILES.balanced;
+  document.getElementById('aiBiasBass').value = p.bassBias;
+  document.getElementById('aiBiasBassVal').textContent = (p.bassBias>0?'+':'')+p.bassBias+'dB';
+  document.getElementById('aiBiasHigh').value = p.highBias;
+  document.getElementById('aiBiasHighVal').textContent = (p.highBias>0?'+':'')+p.highBias+'dB';
+  document.getElementById('aiBiasComp').value = p.compBias;
+  document.getElementById('aiBiasCompVal').textContent = (p.compBias>0?'+':'')+p.compBias+'dB';
+});
+
+// 味付けパラメータを取得
+function getAiBias() {
+  return {
+    bass_bias: parseFloat(document.getElementById('aiBiasBass').value),
+    high_bias: parseFloat(document.getElementById('aiBiasHigh').value),
+    comp_bias: parseFloat(document.getElementById('aiBiasComp').value),
+    strength: parseInt(document.getElementById('aiTasteStrength').value) / 100,
+  };
+}
+
 const aiUploadZone = document.getElementById('aiUploadZone');
 const aiFileInput = document.getElementById('aiFileInput');
 aiUploadZone.addEventListener('dragover', e=>{e.preventDefault();aiUploadZone.classList.add('dragover')});
@@ -1251,10 +1367,11 @@ async function aiUploadFiles(fileList) {
     const ud = await ur.json();
     const fileIds = ud.files.filter(f=>!f.error).map(f=>f.file_id);
     if (!fileIds.length) { toast('❌ アップロード失敗'); setStatus(''); return; }
-    // AI optimize
+    // AI optimize (with bias)
+    const bias = getAiBias();
     const ar = await fetch('/ai-optimize', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({file_ids:fileIds})
+      body:JSON.stringify({file_ids:fileIds, bias:bias})
     });
     const ad = await ar.json();
     aiFiles = ad.results.filter(r=>!r.error);
@@ -1267,7 +1384,7 @@ async function aiUploadFiles(fileList) {
 function renderAiResults() {
   const el = document.getElementById('aiResults');
   el.classList.remove('hidden');
-  el.innerHTML = aiFiles.map(f=>`
+  el.innerHTML = aiFiles.map((f,idx) => `
     <div class="card" style="margin-bottom:12px;padding:16px">
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
         <span style="font-size:1.5rem">🎵</span>
@@ -1281,16 +1398,16 @@ function renderAiResults() {
         </div>
       </div>
       <div style="background:var(--bg);border-radius:var(--radius);padding:10px;margin-bottom:8px">
-        <div class="section-title" style="margin-bottom:6px">🤖 AI推奨設定</div>
+        <div class="section-title" style="margin-bottom:6px">🤖 AI推奨設定 <span style="font-size:.7rem;color:var(--dim)">(クリックで編集可)</span></div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:.75rem">
-          <div><span style="color:var(--dim)">Sub-Bass:</span> <b>${f.settings.subBass>0?'+':''}${f.settings.subBass}dB</b></div>
-          <div><span style="color:var(--dim)">Bass:</span> <b>${f.settings.bass>0?'+':''}${f.settings.bass}dB</b></div>
-          <div><span style="color:var(--dim)">Mid:</span> <b>${f.settings.mid>0?'+':''}${f.settings.mid}dB</b></div>
-          <div><span style="color:var(--dim)">High:</span> <b>${f.settings.high>0?'+':''}${f.settings.high}dB</b></div>
-          <div><span style="color:var(--dim)">Comp:</span> <b>${f.settings.compTh}dB / ${f.settings.compRa}:1</b></div>
-          <div><span style="color:var(--dim)">Limiter:</span> <b>${f.settings.lim}dBFS</b></div>
-          <div><span style="color:var(--dim)">LUFS:</span> <b>${f.settings.lufs}</b></div>
-          <div><span style="color:var(--dim)">Stereo:</span> <b>${f.settings.stereo}x</b></div>
+          <div><span style="color:var(--dim)">Sub-Bass:</span> <input type="number" class="ai-edit" data-key="subBass" data-idx="${idx}" value="${f.settings.subBass}" style="width:50px;font-size:.75rem;padding:2px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text)">dB</div>
+          <div><span style="color:var(--dim)">Bass:</span> <input type="number" class="ai-edit" data-key="bass" data-idx="${idx}" value="${f.settings.bass}" style="width:50px;font-size:.75rem;padding:2px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text)">dB</div>
+          <div><span style="color:var(--dim)">Mid:</span> <input type="number" class="ai-edit" data-key="mid" data-idx="${idx}" value="${f.settings.mid}" style="width:50px;font-size:.75rem;padding:2px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text)">dB</div>
+          <div><span style="color:var(--dim)">High:</span> <input type="number" class="ai-edit" data-key="high" data-idx="${idx}" value="${f.settings.high}" style="width:50px;font-size:.75rem;padding:2px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text)">dB</div>
+          <div><span style="color:var(--dim)">Comp:</span> <input type="number" class="ai-edit" data-key="compTh" data-idx="${idx}" value="${f.settings.compTh}" style="width:50px;font-size:.75rem;padding:2px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text)">dB / <input type="number" class="ai-edit" data-key="compRa" data-idx="${idx}" value="${f.settings.compRa}" style="width:40px;font-size:.75rem;padding:2px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text)">:1</div>
+          <div><span style="color:var(--dim)">Limiter:</span> <input type="number" class="ai-edit" data-key="lim" data-idx="${idx}" value="${f.settings.lim}" step="0.1" style="width:50px;font-size:.75rem;padding:2px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text)">dBFS</div>
+          <div><span style="color:var(--dim)">LUFS:</span> <input type="number" class="ai-edit" data-key="lufs" data-idx="${idx}" value="${f.settings.lufs}" style="width:50px;font-size:.75rem;padding:2px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text)"></div>
+          <div><span style="color:var(--dim)">Stereo:</span> <input type="number" class="ai-edit" data-key="stereo" data-idx="${idx}" value="${f.settings.stereo}" step="0.1" style="width:50px;font-size:.75rem;padding:2px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text)">x</div>
         </div>
       </div>
       <div style="font-size:.75rem;color:var(--dim);margin-bottom:8px">
@@ -1303,6 +1420,14 @@ function renderAiResults() {
       </div>
     </div>
   `).join('');
+  // 編集フィールドにイベントリスナー追加
+  document.querySelectorAll('.ai-edit').forEach(inp => {
+    inp.addEventListener('change', e => {
+      const idx = parseInt(e.target.dataset.idx);
+      const key = e.target.dataset.key;
+      aiFiles[idx].settings[key] = parseFloat(e.target.value);
+    });
+  });
 }
 
 function genreLabel(g) {
@@ -1912,6 +2037,7 @@ def ai_optimize():
     """Analyze file(s) and return AI-recommended mastering settings."""
     data = request.json
     file_ids = data.get("file_ids", [])
+    bias = data.get("bias", {})  # {bass_bias, high_bias, comp_bias, strength}
     if not file_ids:
         # Single file mode
         fid = data.get("file_id")
@@ -1930,7 +2056,7 @@ def ai_optimize():
             audio, sr = read_audio(str(fpath[0]))
             analysis = analyze_spectrum(audio, sr)
             genre, confidence = classify_genre(audio, sr, analysis)
-            recommended = recommend_settings(analysis, genre, confidence)
+            recommended = recommend_settings(analysis, genre, confidence, bias=bias)
             reasoning = recommended.pop("_reasoning", [])
             results.append({
                 "file_id": fid,
