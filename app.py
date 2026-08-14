@@ -922,6 +922,7 @@ border-radius:var(--radius);padding:8px;cursor:pointer;font-size:.75rem;width:10
         <option value="44100">44,100 Hz (CD)</option>
         <option value="48000" selected>48,000 Hz</option>
         <option value="96000">96,000 Hz (Hi-Res)</option>
+        <option value="192000">192,000 Hz (Ultra Hi-Res)</option>
       </select>
       <div style="margin-top:8px">
         <label>出力形式</label>
@@ -1062,6 +1063,7 @@ border-radius:var(--radius);padding:8px;cursor:pointer;font-size:.75rem;width:10
 <script>
 // State
 let fileId = null;
+let currentFileName = null;
 let beforeData = null;
 let afterData = null;
 let eqBands = [];
@@ -1577,6 +1579,7 @@ async function uploadFile(file) {
     const d = await r.json();
     if (d.error) { toast('❌ '+d.error); setStatus(''); return; }
     fileId = d.file_id;
+    currentFileName = file.name;
     document.getElementById('fileName').textContent = file.name;
     document.getElementById('fileMeta').textContent = `${d.channels}ch / ${d.sr}Hz / ${d.duration}s`;
     document.getElementById('fileInfo').classList.remove('hidden');
@@ -1696,10 +1699,10 @@ async function doRemaster() {
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
 
-    // Also fetch after-analysis
+    // Also fetch after-analysis (from already-remastered file)
     const ar = await fetch('/analyze-result', {method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({file_id:fileId, params:getParams()})
+      body:JSON.stringify({file_id:fileId, format:fmt})
     });
     if (ar.ok) {
       afterData = await ar.json();
@@ -1709,13 +1712,24 @@ async function doRemaster() {
     }
 
     document.getElementById('downloadLink').href = url;
-    document.getElementById('downloadLink').download = `remastered.${fmt}`;
+    const origName = currentFileName || 'audio';
+    const baseName = origName.replace(/\.[^.]+$/, '');
+    document.getElementById('downloadLink').download = `${baseName}_remastered.${fmt}`;
     document.getElementById('downloadInfo').textContent =
-      `RMS: ${afterData?.rms_db||'?'} dBFS | Peak: ${afterData?.peak_db||'?'} dBFS`;
+      `RMS: ${afterData?.rms_db?.toFixed(1)||'?'} dBFS | Peak: ${afterData?.peak_db?.toFixed(1)||'?'} dBFS`;
     document.getElementById('downloadSection').classList.remove('hidden');
     document.getElementById('progressSection').classList.add('hidden');
-    document.getElementById('spectrumSection').classList.remove('hidden');
+    // spectrumは描画完了後に表示
     document.getElementById('btnRemaster').disabled = false;
+    // After波形を描画（キャンバス表示後にoffsetWidthが取れる）
+    requestAnimationFrame(() => {
+      document.getElementById('spectrumSection').classList.remove('hidden');
+      requestAnimationFrame(() => {
+        if (afterData && afterData.spectrum) {
+          drawSpectrum('canvasAfter', afterData.spectrum);
+        }
+      });
+    });
     toast('✅ 完了！ nya~');
   } catch(e) {
     clearInterval(iv);
@@ -1828,15 +1842,19 @@ def remaster_endpoint():
 
 @app.route("/analyze-result", methods=["POST"])
 def analyze_result():
+    """Analyze the ALREADY remastered file (no re-processing)."""
     data = request.json
     fid = data.get("file_id")
-    params = data.get("params", {})
-    fpath = list(UPLOAD_DIR.glob(f"{fid}.*"))
-    if not fpath:
-        return jsonify({"error": "not found"}), 404
-    audio, sr = read_audio(str(fpath[0]), params.get("sample_rate", 48000))
-    result = remaster(audio, sr, params)
-    return jsonify(analyze_spectrum(result, sr))
+    fmt = data.get("format", "wav")
+    # 既存のリマスター済みファイルを探す
+    out_path = OUTPUT_DIR / f"{fid}_remastered.{fmt}"
+    if not out_path.exists():
+        return jsonify({"error": "リマスター済みファイルが見つかりません"}), 404
+    try:
+        audio, sr = read_audio(str(out_path))
+        return jsonify(analyze_spectrum(audio, sr))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/upload-batch", methods=["POST"])
