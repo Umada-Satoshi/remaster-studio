@@ -1095,7 +1095,22 @@ function switchMode(mode) {
       s.style.display = mode==='single' ? '' : 'none';
     }
   });
+  // タブ切り替え後にスペクトルを再描画（キャンバス尺寸が変わるため）
+  if (mode === 'single') {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (beforeData && beforeData.spectrum) drawSpectrum('canvasBefore', beforeData.spectrum);
+        if (afterData && afterData.spectrum) drawSpectrum('canvasAfter', afterData.spectrum);
+      });
+    });
+  }
 }
+
+// ── Window resize: redraw spectrums ──────────────────────────────
+window.addEventListener('resize', () => {
+  if (beforeData && beforeData.spectrum) drawSpectrum('canvasBefore', beforeData.spectrum);
+  if (afterData && afterData.spectrum) drawSpectrum('canvasAfter', afterData.spectrum);
+});
 
 // ── Batch Upload ────────────────────────────────────────────────────
 const batchUploadZone = document.getElementById('batchUploadZone');
@@ -1605,10 +1620,14 @@ function renderBefore() {
     <div class="stat"><div class="num">${s.crest_db}</div><div class="unit">Crest dB</div></div>
     <div class="stat"><div class="num">${s.duration}s</div><div class="unit">${s.channels}</div></div>
   `;
-  // Spectrum
-  drawSpectrum('canvasBefore', s.spectrum);
-  // Band bars
+  // Band bars (immediate, no canvas dependency)
   renderBars('barsBefore', s.bands, false);
+  // Spectrum — defer until canvas is visible and has dimensions
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      drawSpectrum('canvasBefore', s.spectrum);
+    });
+  });
 }
 
 function renderBars(id, bands, isAfter) {
