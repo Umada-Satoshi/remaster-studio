@@ -735,7 +735,7 @@ label{display:block;font-size:.8rem;color:var(--dim);margin-bottom:4px}
 input[type=range]{width:100%;accent-color:var(--accent);height:6px;margin:4px 0}
 .val{float:right;color:var(--accent);font-weight:600;font-size:.8rem;font-variant-numeric:tabular-nums}
 select,input[type=number]{background:var(--bg);color:var(--text);border:1px solid var(--border);
-border-radius:4px;padding:6px 8px;width:100%;font-size:.85rem}
+border-radius:4px;padding:6px 8px;font-size:.85rem}
 .btn{padding:10px 20px;border:none;border-radius:var(--radius);font-size:.85rem;
 font-weight:600;cursor:pointer;transition:all .15s}
 .btn-primary{background:var(--accent);color:#000}
@@ -1073,7 +1073,7 @@ border-radius:var(--radius);padding:8px;cursor:pointer;font-size:.75rem;width:10
       </div>
 
       <!-- 味付けコントロール -->
-      <div id="aiTasteControls" style="background:var(--card);border-radius:var(--radius);padding:16px;margin-bottom:16px">
+      <div id="aiTasteControls" style="background:var(--card);border-radius:var(--radius);padding:16px;margin-bottom:16px;display:block !important;visibility:visible !important;opacity:1 !important;min-height:100px">
         <div class="section-title" style="margin-bottom:12px">🎨 AI味付け</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div>
