@@ -27,8 +27,9 @@ from scipy import signal
 
 app = Flask(__name__)
 # Fixed paths — all gunicorn workers share the same filesystem
-UPLOAD_DIR = Path("/app/data/uploads")
-OUTPUT_DIR = Path("/app/data/outputs")
+_DATA = Path(os.environ.get("REMASTER_DATA_DIR", "/app/data"))
+UPLOAD_DIR = _DATA / "uploads"
+OUTPUT_DIR = _DATA / "outputs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
@@ -389,36 +390,304 @@ def write_audio(audio, sr, path, fmt="wav", bitrate="320k"):
     os.unlink(tmp)
 
 
+# ── PhaseLimiter-derived DSP ─────────────────────────────────────────
+# Algorithms inspired by ai-mastering/phaselimiter (MIT License)
+# https://github.com/ai-mastering/phaselimiter
+
+def phase_limit(audio, sr, ceiling_db=-0.5, lookahead_ms=5, release_ms=100):
+    """Phase-coherent limiter — minimizes gain reduction artifacts.
+    Unlike traditional limiters, this preserves phase relationships
+    by using smooth gain curves derived from the envelope."""
+    ceiling = 10 ** (ceiling_db / 20.0)
+    lookahead = int(sr * lookahead_ms / 1000)
+    release_samples = int(sr * release_ms / 1000)
+    release_coeff = np.exp(-1.0 / release_samples)
+
+    out = np.copy(audio)
+    for ch in range(out.shape[0]):
+        # Forward peak detection with lookahead
+        abs_signal = np.abs(out[ch])
+        # Find peaks in lookahead window
+        gain_curve = np.ones(len(abs_signal))
+        for i in range(len(abs_signal)):
+            window_end = min(i + lookahead, len(abs_signal))
+            max_in_window = np.max(abs_signal[i:window_end])
+            if max_in_window > ceiling:
+                gain_curve[i] = ceiling / (max_in_window + 1e-10)
+
+        # Smooth the gain curve (phase-coherent approach)
+        smoothed = np.copy(gain_curve)
+        # Forward smoothing
+        for i in range(1, len(smoothed)):
+            if smoothed[i] > smoothed[i-1]:
+                smoothed[i] = smoothed[i-1] * release_coeff + smoothed[i] * (1 - release_coeff)
+        # Backward smoothing (lookahead)
+        for i in range(len(smoothed) - 2, -1, -1):
+            if smoothed[i] > smoothed[i+1]:
+                smoothed[i] = smoothed[i+1] * release_coeff + smoothed[i] * (1 - release_coeff)
+
+        out[ch] *= smoothed
+    return out
+
+
+def loudness_mapping_compress(audio, sr, target_lufs=-14, strength=0.7):
+    """Statistical loudness distribution mapping (phaselimiter LoudnessMapping).
+    Maps input loudness distribution to target distribution.
+    More natural than traditional threshold/ratio compression."""
+    mono = (audio[0] + audio[1]) / 2.0 if audio.shape[0] == 2 else audio[0]
+
+    # Calculate loudness histogram (frame-based)
+    frame_size = int(sr * 0.02)  # 20ms frames
+    loudness_values = []
+    for i in range(0, len(mono) - frame_size, frame_size):
+        frame = mono[i:i + frame_size]
+        rms = np.sqrt(np.mean(frame ** 2) + 1e-10)
+        loudness_db = 20 * np.log10(rms + 1e-10)
+        loudness_values.append(loudness_db)
+
+    if not loudness_values:
+        return audio
+
+    loudness_arr = np.array(loudness_values)
+    original_mean = np.mean(loudness_arr)
+    original_std = np.std(loudness_arr) + 1e-10
+
+    # Target distribution
+    target_mean = target_lufs
+    target_std = original_std * (1 - strength) + 6.0 * strength  # target ~6dB dynamic range
+
+    # Loudness mapping function
+    inv_ratio = min(1.0, target_std / original_std)
+    threshold = original_mean - 40
+
+    def map_loudness(x):
+        if x >= threshold:
+            return (x - original_mean) * inv_ratio + target_mean
+        else:
+            gain = (threshold - original_mean) * inv_ratio + target_mean - threshold
+            return x + gain
+
+    # Apply frame-wise gain
+    out = np.copy(audio)
+    for ch in range(out.shape[0]):
+        for i in range(0, len(mono) - frame_size, frame_size):
+            frame = mono[i:i + frame_size]
+            rms = np.sqrt(np.mean(frame ** 2) + 1e-10)
+            current_db = 20 * np.log10(rms + 1e-10)
+            target_db = map_loudness(current_db)
+            gain_db = target_db - current_db
+            gain = 10 ** (gain_db / 20.0)
+            out[ch, i:i + frame_size] *= gain
+
+    return out
+
+
+def ms_compressor(audio, sr, threshold_db=-20, ratio=3, side_boost_db=0):
+    """Mid/Side domain compression (phaselimiter MsCompressor).
+    Processes mid and side channels independently for better
+    stereo image control."""
+    if audio.shape[0] != 2:
+        return audio
+
+    # Convert to M/S
+    mid = (audio[0] + audio[1]) / 2.0
+    side = (audio[0] - audio[1]) / 2.0
+
+    # Compress mid channel
+    mid_compressed = single_band_compress(mid, sr, threshold_db, ratio)
+
+    # Process side channel (boost or compress)
+    if side_boost_db != 0:
+        b, a = design_biquad("peaking", 2000, sr, side_boost_db, 0.707)
+        side = apply_iir(side.reshape(1, -1), b, a)[0]
+    side_compressed = single_band_compress(side, sr, threshold_db - 3, ratio * 0.5)
+
+    # Convert back to L/R
+    left = mid_compressed + side_compressed
+    right = mid_compressed - side_compressed
+    return np.array([left, right])
+
+
+def single_band_compress(channel, sr, threshold_db=-20, ratio=3):
+    """Single-band compressor for one channel."""
+    frame_size = int(sr * 0.02)
+    out = np.copy(channel)
+    atk = np.exp(-1.0 / (sr * 0.003))  # 3ms attack
+    rel = np.exp(-1.0 / (sr * 0.100))  # 100ms release
+
+    current_env = -100.0
+    for i in range(0, len(channel) - frame_size, frame_size):
+        frame = channel[i:i + frame_size]
+        rms = np.sqrt(np.mean(frame ** 2) + 1e-10)
+        env_db = 20 * np.log10(rms + 1e-10)
+
+        # Envelope follower
+        if env_db > current_env:
+            current_env = atk * current_env + (1 - atk) * env_db
+        else:
+            current_env = rel * current_env + (1 - rel) * env_db
+
+        # Gain reduction
+        if current_env > threshold_db:
+            overshoot = current_env - threshold_db
+            reduction = overshoot * (1 - 1.0 / ratio)
+            gain = 10 ** (-reduction / 20.0)
+            out[i:i + frame_size] *= gain
+
+    return out
+
+
+def highpass_fir(audio, sr, cutoff_freq=20, attenuation_db=70):
+    """FIR high-pass filter for rumble removal (phaselimiter CutLowAndHighFreq).
+    Uses Keiser window design for clean stopband attenuation."""
+    if cutoff_freq <= 0:
+        return audio
+
+    normalized_freq = cutoff_freq / sr
+    transition_width = 5.0 / sr
+
+    # Keiser window parameters
+    alpha = 0.1102 * (attenuation_db - 8.7)
+    filter_len = int((attenuation_db - 7.95) / (2.285 * np.pi * transition_width)) + 1
+    filter_len = max(filter_len, 64)
+    if filter_len % 2 == 0:
+        filter_len += 1
+
+    # Design FIR bandpass (high-pass = bandpass from cutoff to Nyquist)
+    n = np.arange(filter_len)
+    mid = (filter_len - 1) / 2.0
+    h = np.zeros(filter_len)
+    for i in range(filter_len):
+        if i == mid:
+            h[i] = 1.0 - 2.0 * normalized_freq
+        else:
+            h[i] = (np.sin(np.pi * (i - mid) * (1.0 - 2.0 * normalized_freq)) -
+                     np.sin(np.pi * (i - mid) * 2.0 * normalized_freq)) / (np.pi * (i - mid))
+
+    # Apply Keiser window
+    window = np.kaiser(filter_len, alpha)
+    h *= window
+    h /= np.sum(h)
+
+    # Apply FIR filter
+    out = np.copy(audio)
+    for ch in range(out.shape[0]):
+        out[ch] = np.convolve(audio[ch], h, mode='same')
+    return out
+
+
+def parallel_compress(audio, sr, dry_gain_db=0, wet_gain_db=-6, threshold_db=-20, ratio=4):
+    """Parallel compression (phaselimiter parallel_compression).
+    Blends compressed and uncompressed signals for natural dynamics."""
+    dry = audio.copy()
+    wet = multiband_compress(audio, sr, [threshold_db], [ratio])
+
+    dry_gain = 10 ** (dry_gain_db / 20.0)
+    wet_gain = 10 ** (wet_gain_db / 20.0)
+
+    return dry * dry_gain + wet * wet_gain
+
+
+def true_peak_limiter(audio, sr, ceiling_db=-0.5, oversample=4):
+    """True peak limiter with oversampling (phaselimiter ceiling_mode=true_peak).
+    Detects inter-sample peaks that traditional limiters miss."""
+    ceiling = 10 ** (ceiling_db / 20.0)
+
+    out = np.copy(audio)
+    for ch in range(out.shape[0]):
+        # Upsample for true peak detection
+        upsampled = signal.resample(audio[ch], len(audio[ch]) * oversample)
+        # Find true peaks
+        abs_up = np.abs(upsampled)
+        # Downsample peak envelope
+        peak_env = np.array([np.max(abs_up[i*oversample:(i+1)*oversample])
+                           for i in range(len(audio[ch]))])
+
+        # Apply limiting where true peak exceeds ceiling
+        mask = peak_env > ceiling
+        if np.any(mask):
+            gain = np.ones(len(audio[ch]))
+            gain[mask] = ceiling / (peak_env[mask] + 1e-10)
+            # Smooth gain changes
+            smoothed = np.copy(gain)
+            for i in range(1, len(smoothed)):
+                smoothed[i] = min(smoothed[i], smoothed[i-1] * 0.999 + smoothed[i] * 0.001)
+            for i in range(len(smoothed) - 2, -1, -1):
+                smoothed[i] = min(smoothed[i], smoothed[i+1] * 0.999 + smoothed[i] * 0.001)
+            out[ch] *= smoothed
+
+    return out
+
+
 def remaster(audio, sr, p):
-    # 1. Low-shelf bass boost
+    """Full mastering pipeline combining traditional DSP with
+    phaselimiter-derived algorithms for superior quality."""
+
+    # Stage 0: Rumble removal (phaselimiter CutLowAndHighFreq)
+    audio = highpass_fir(audio, sr, cutoff_freq=p.get("highpass_freq", 20))
+
+    # Stage 1: EQ Chain
+    # 1a. Low-shelf bass boost
     b,a = design_biquad("low_shelf", p.get("bass_freq",150), sr, p.get("bass_boost_db",6), 0.707)
     audio = apply_iir(audio, b, a)
-    # 2. Sub-bass peak
+    # 1b. Sub-bass peak
     b,a = design_biquad("peaking", p.get("sub_bass_freq",60), sr, p.get("sub_bass_boost_db",4), 0.5)
     audio = apply_iir(audio, b, a)
-    # 3. Mid peak
+    # 1c. Mid peak
     b,a = design_biquad("peaking", p.get("mid_freq",3000), sr, p.get("mid_db",2), 1.0)
     audio = apply_iir(audio, b, a)
-    # 4. High-shelf
+    # 1d. High-shelf
     b,a = design_biquad("high_shelf", p.get("high_freq",8000), sr, p.get("high_db",1.5), 0.707)
     audio = apply_iir(audio, b, a)
-    # 5. Optional custom EQ bands
+    # 1e. Optional custom EQ bands
     for eq in p.get("custom_eq", []):
         b,a = design_biquad(eq["type"], eq["freq"], sr, eq["gain"], eq.get("q",0.707))
         audio = apply_iir(audio, b, a)
-    # 6. Multiband compressor
+
+    # Stage 2: Loudness mapping compression (phaselimiter LoudnessMapping)
+    # More natural than traditional threshold/ratio compression
+    audio = loudness_mapping_compress(audio, sr,
+        target_lufs=p.get("target_lufs", -14),
+        strength=p.get("loudness_mapping_strength", 0.5))
+
+    # Stage 3: Mid/Side compression (phaselimiter MsCompressor)
+    audio = ms_compressor(audio, sr,
+        threshold_db=p.get("ms_threshold", -22),
+        ratio=p.get("ms_ratio", 2.0),
+        side_boost_db=p.get("ms_side_boost", 0))
+
+    # Stage 4: Multiband compressor (traditional)
     ct = p.get("comp_threshold", -20)
     cr = p.get("comp_ratio", 3)
     audio = multiband_compress(audio, sr, [ct]*3, [cr]*3)
-    # 7. Limiter
-    audio = limiter(audio, p.get("limiter_ceiling", -0.5))
-    # 8. LUFS
+
+    # Stage 5: Parallel compression (phaselimiter)
+    audio = parallel_compress(audio, sr,
+        dry_gain_db=0,
+        wet_gain_db=p.get("parallel_wet_db", -6),
+        threshold_db=p.get("parallel_threshold", -24),
+        ratio=p.get("parallel_ratio", 4))
+
+    # Stage 6: Phase-coherent limiter (phaselimiter core)
+    audio = phase_limit(audio, sr,
+        ceiling_db=p.get("limiter_ceiling", -0.5),
+        lookahead_ms=p.get("lookahead_ms", 5),
+        release_ms=p.get("limiter_release_ms", 100))
+
+    # Stage 7: True peak limiter (phaselimiter true_peak)
+    audio = true_peak_limiter(audio, sr,
+        ceiling_db=p.get("true_peak_ceiling", -0.3),
+        oversample=p.get("true_peak_oversample", 4))
+
+    # Stage 8: LUFS normalization
     audio = normalize_lufs(audio, sr, p.get("target_lufs", -14))
-    # 9. Stereo
+
+    # Stage 9: Stereo enhancement
     sw = p.get("stereo_width", 1.2)
     if sw != 1.0:
         audio = stereo_enhance(audio, sw)
-    # 10. Final limiter
+
+    # Stage 10: Final safety clip
     return np.clip(audio, -1.0, 1.0)
 
 
