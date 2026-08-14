@@ -21,8 +21,11 @@
 ### クイックスタート
 
 ```bash
-# ビルド & 起動
+# ビルド & 起動（初回・コード更新後は --build 必須）
 docker compose up -d --build
+
+# コード更新後の強制再ビルド（キャッシュ回避）
+docker compose up -d --build --force-recreate
 
 # アクセス
 open http://localhost:7860
