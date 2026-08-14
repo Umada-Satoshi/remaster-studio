@@ -1046,6 +1046,7 @@ border-radius:var(--radius);padding:8px;cursor:pointer;font-size:.75rem;width:10
     <div style="margin-top:12px">
       <button class="btn btn-secondary btn-sm" onclick="resetAll()">🔄 もう一度</button>
     </div>
+  </div>
 
     <!-- Batch Mode: Upload -->
     <div id="batchUploadSection" class="hidden">
@@ -1073,8 +1074,8 @@ border-radius:var(--radius);padding:8px;cursor:pointer;font-size:.75rem;width:10
       </div>
 
       <!-- 味付けコントロール -->
-      <div id="aiTasteControls" style="background:#ff0000;color:#fff;padding:16px;margin-bottom:16px;display:block !important;border:3px solid yellow;font-size:16px">
-        <div style="font-weight:bold;font-size:20px;margin-bottom:8px">🎨 AI味付け — テスト表示（赤背景なら見える）</div>
+      <div id="aiTasteControls" style="background:var(--card);border-radius:var(--radius);padding:16px;margin-bottom:16px">
+        <div class="section-title" style="margin-bottom:12px">🎨 AI味付け</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div>
             <label style="font-size:.8rem;color:var(--dim)">味付けプロフィール</label>
