@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 import tempfile
 import time
 import uuid
@@ -24,6 +25,11 @@ from pathlib import Path
 import numpy as np
 from flask import Flask, jsonify, request, send_file, render_template_string
 from scipy import signal
+from dsp_optimized import (
+    limiter_fast, phase_limit_fast, multiband_compress_fast,
+    loudness_mapping_compress_fast, single_band_compress_fast,
+    true_peak_limiter_fast
+)
 
 app = Flask(__name__)
 # Fixed paths — all gunicorn workers share the same filesystem
@@ -494,13 +500,13 @@ def ms_compressor(audio, sr, threshold_db=-20, ratio=3, side_boost_db=0):
     side = (audio[0] - audio[1]) / 2.0
 
     # Compress mid channel
-    mid_compressed = single_band_compress(mid, sr, threshold_db, ratio)
+    mid_compressed = single_band_compress_fast(mid, sr, threshold_db, ratio)
 
     # Process side channel (boost or compress)
     if side_boost_db != 0:
         b, a = design_biquad("peaking", 2000, sr, side_boost_db, 0.707)
         side = apply_iir(side.reshape(1, -1), b, a)[0]
-    side_compressed = single_band_compress(side, sr, threshold_db - 3, ratio * 0.5)
+    side_compressed = single_band_compress_fast(side, sr, threshold_db - 3, ratio * 0.5)
 
     # Convert back to L/R
     left = mid_compressed + side_compressed
@@ -539,40 +545,25 @@ def single_band_compress(channel, sr, threshold_db=-20, ratio=3):
 
 def highpass_fir(audio, sr, cutoff_freq=20, attenuation_db=70):
     """FIR high-pass filter for rumble removal (phaselimiter CutLowAndHighFreq).
-    Uses Keiser window design for clean stopband attenuation."""
+    Uses scipy.signal.fftconvolve for efficient long-filter convolution."""
     if cutoff_freq <= 0:
         return audio
 
-    normalized_freq = cutoff_freq / sr
-    transition_width = 5.0 / sr
+    # scipy.signal.firwin で正規化されたhigh-passフィルタを設計
+    # numtaps を適応的に計算（attenuationとtransition_widthから）
+    transition_width = 5.0  # Hz
+    numtaps = int((attenuation_db - 7.95) / (2.285 * np.pi * transition_width / sr)) + 1
+    numtaps = max(numtaps, 64)
+    if numtaps % 2 == 0:
+        numtaps += 1
 
-    # Keiser window parameters
-    alpha = 0.1102 * (attenuation_db - 8.7)
-    filter_len = int((attenuation_db - 7.95) / (2.285 * np.pi * transition_width)) + 1
-    filter_len = max(filter_len, 64)
-    if filter_len % 2 == 0:
-        filter_len += 1
+    # firwin でhigh-passフィルタ係数を生成
+    h = signal.firwin(numtaps, cutoff_freq, fs=sr, pass_zero=False)
 
-    # Design FIR bandpass (high-pass = bandpass from cutoff to Nyquist)
-    n = np.arange(filter_len)
-    mid = (filter_len - 1) / 2.0
-    h = np.zeros(filter_len)
-    for i in range(filter_len):
-        if i == mid:
-            h[i] = 1.0 - 2.0 * normalized_freq
-        else:
-            h[i] = (np.sin(np.pi * (i - mid) * (1.0 - 2.0 * normalized_freq)) -
-                     np.sin(np.pi * (i - mid) * 2.0 * normalized_freq)) / (np.pi * (i - mid))
-
-    # Apply Keiser window
-    window = np.kaiser(filter_len, alpha)
-    h *= window
-    h /= np.sum(h)
-
-    # Apply FIR filter
+    # FFT-based convolution（長いフィルタでも高速）
     out = np.copy(audio)
     for ch in range(out.shape[0]):
-        out[ch] = np.convolve(audio[ch], h, mode='same')
+        out[ch] = signal.fftconvolve(audio[ch], h, mode='same')
     return out
 
 
@@ -580,7 +571,7 @@ def parallel_compress(audio, sr, dry_gain_db=0, wet_gain_db=-6, threshold_db=-20
     """Parallel compression (phaselimiter parallel_compression).
     Blends compressed and uncompressed signals for natural dynamics."""
     dry = audio.copy()
-    wet = multiband_compress(audio, sr, [threshold_db], [ratio])
+    wet = multiband_compress_fast(audio, sr, [threshold_db], [ratio])
 
     dry_gain = 10 ** (dry_gain_db / 20.0)
     wet_gain = 10 ** (wet_gain_db / 20.0)
@@ -646,7 +637,7 @@ def remaster(audio, sr, p):
 
     # Stage 2: Loudness mapping compression (phaselimiter LoudnessMapping)
     # More natural than traditional threshold/ratio compression
-    audio = loudness_mapping_compress(audio, sr,
+    audio = loudness_mapping_compress_fast(audio, sr,
         target_lufs=p.get("target_lufs", -14),
         strength=p.get("loudness_mapping_strength", 0.5))
 
@@ -659,7 +650,7 @@ def remaster(audio, sr, p):
     # Stage 4: Multiband compressor (traditional)
     ct = p.get("comp_threshold", -20)
     cr = p.get("comp_ratio", 3)
-    audio = multiband_compress(audio, sr, [ct]*3, [cr]*3)
+    audio = multiband_compress_fast(audio, sr, [ct]*3, [cr]*3)
 
     # Stage 5: Parallel compression (phaselimiter)
     audio = parallel_compress(audio, sr,
@@ -669,13 +660,13 @@ def remaster(audio, sr, p):
         ratio=p.get("parallel_ratio", 4))
 
     # Stage 6: Phase-coherent limiter (phaselimiter core)
-    audio = phase_limit(audio, sr,
+    audio = phase_limit_fast(audio, sr,
         ceiling_db=p.get("limiter_ceiling", -0.5),
         lookahead_ms=p.get("lookahead_ms", 5),
         release_ms=p.get("limiter_release_ms", 100))
 
     # Stage 7: True peak limiter (phaselimiter true_peak)
-    audio = true_peak_limiter(audio, sr,
+    audio = true_peak_limiter_fast(audio, sr,
         ceiling_db=p.get("true_peak_ceiling", -0.3),
         oversample=p.get("true_peak_oversample", 4))
 
@@ -1174,7 +1165,14 @@ async function doBatchRemaster() {
 function renderBatchResults(results) {
   const el = document.getElementById('batchResults');
   el.classList.remove('hidden');
-  el.innerHTML = '<div class="section-title">📥 ダウンロード</div>' + results.map(r=>{
+  const successFiles = results.filter(r=>!r.error);
+  let html = '<div class="section-title">📥 ダウンロード</div>';
+  if (successFiles.length > 1) {
+    html += `<div style="margin-bottom:12px">
+      <button class="btn btn-primary" onclick="downloadBatchZip()">📦 全部ZIP DL (${successFiles.length}ファイル)</button>
+    </div>`;
+  }
+  html += results.map(r=>{
     if (r.error) return `<div class="card" style="padding:8px;color:var(--red)">❌ ${r.filename}: ${r.error}</div>`;
     const sizeMB = (r.size/1024/1024).toFixed(1);
     return `<div class="card" style="padding:8px;display:flex;align-items:center;gap:8px">
@@ -1184,6 +1182,29 @@ function renderBatchResults(results) {
       <a href="/download/${r.output}" class="btn btn-primary btn-sm" download style="text-decoration:none;font-size:.75rem">💾 DL</a>
     </div>`;
   }).join('');
+  el.innerHTML = html;
+}
+
+async function downloadBatchZip() {
+  const files = batchFiles.map(f => {
+    const fmt = document.getElementById('outFormat')?.value || 'wav';
+    return `${f.file_id}_remastered.${fmt}`;
+  });
+  try {
+    const r = await fetch('/download-batch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filenames: files})
+    });
+    if (!r.ok) throw new Error('ZIP作成失敗');
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'remastered_batch.zip';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    toast('📦 ZIP ダウンロード開始');
+  } catch(e) { toast('❌ ZIP ダウンロード失敗'); }
 }
 
 function resetBatch() {
@@ -1935,6 +1956,30 @@ def download_file(filename):
     if not fpath.exists():
         return jsonify({"error": "ファイルが見つかりません"}), 404
     return send_file(str(fpath), as_attachment=True, download_name=filename)
+
+
+@app.route("/download-batch", methods=["POST"])
+def download_batch():
+    """Download multiple remastered files as a ZIP archive."""
+    data = request.json
+    filenames = data.get("filenames", [])
+    if not filenames:
+        return jsonify({"error": "filenames が指定されていません"}), 400
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in filenames:
+            fpath = OUTPUT_DIR / fname
+            if fpath.exists():
+                zf.write(str(fpath), fname)
+    zip_buffer.seek(0)
+
+    return send_file(
+        zip_buffer,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="remastered_batch.zip",
+    )
 
 
 if __name__ == "__main__":

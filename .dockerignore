@@ -7,9 +7,14 @@ __pycache__
 *.md
 !requirements.txt
 docker-compose.yml
-Dockerfile.dockerignore
+Dockerfile
+.dockerignore
 venv/
 .venv/
 *.log
 .DS_Store
 Thumbs.db
+benchmark*.py
+data/
+.numba_cache/
+*.ipynb

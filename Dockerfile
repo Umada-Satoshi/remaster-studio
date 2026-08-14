@@ -1,32 +1,45 @@
-FROM python:3.11-slim
+FROM python:3.12-slim AS base
 
 LABEL maintainer="Remaster Studio"
-LABEL description="High-quality audio remastering tool with AI auto-optimization"
+LABEL description="High-quality audio remastering tool with AI auto-optimization + Numba JIT"
 
-# Install ffmpeg and system deps
+# ── System deps ──────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# ── Python deps ──────────────────────────────────────────────────
 WORKDIR /app
 
-# Copy requirements first for layer caching
+# requirements.txt を先にコピーしてレイヤーキャッシュ
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# ── Application code ─────────────────────────────────────────────
 COPY app.py .
+COPY dsp_optimized.py .
+COPY remaster.py .
 
-# Create output directories
+# ── Data directories ─────────────────────────────────────────────
 RUN mkdir -p /app/data/uploads /app/data/outputs
 
-# Expose port
+# ── Numba JIT キャッシュディレクトリ ────────────────────────────
+ENV NUMBA_CACHE_DIR=/app/.numba_cache
+RUN mkdir -p /app/.numba_cache
+
+# ── Environment ──────────────────────────────────────────────────
+ENV PYTHONUNBUFFERED=1
+ENV REMASTER_DATA_DIR=/app/data
+ENV PYTHONPATH=/app
+
+# ── Port ─────────────────────────────────────────────────────────
 EXPOSE 7860
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+# ── Health check ─────────────────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:7860/')" || exit 1
 
-# Run with gunicorn for production
-CMD ["gunicorn", "--bind", "0.0.0.0:7860", "--workers", "2", "--timeout", "300", "--access-logfile", "-", "app:app"]
+# ── Startup ──────────────────────────────────────────────────────
+# gunicorn: worker timeout 300s (large file processing)
+CMD ["gunicorn", "--bind", "0.0.0.0:7860", "--workers", "2", "--threads", "2", "--timeout", "300", "--access-logfile", "-", "app:app"]

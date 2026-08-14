@@ -5,14 +5,28 @@ services:
     ports:
       - "7860:7860"
     volumes:
-      - ./data:/app/data
+      # アップロードファイル（永続）
+      - remaster-uploads:/app/data/uploads
+      # 出力ファイル（永続）
+      - remaster-outputs:/app/data/outputs
+      # Numba JIT キャッシュ（永続 — 初回起動高速化）
+      - remaster-numba-cache:/app/.numba_cache
     environment:
       - PYTHONUNBUFFERED=1
       - REMASTER_DATA_DIR=/app/data
+      - PYTHONPATH=/app
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 4G
         reservations:
           memory: 512M
+
+volumes:
+  remaster-uploads:
+    driver: local
+  remaster-outputs:
+    driver: local
+  remaster-numba-cache:
+    driver: local
